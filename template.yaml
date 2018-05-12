@@ -1,0 +1,224 @@
+Transform: AWS::Serverless-2016-10-31
+Description: staging server stack
+Parameters:
+  Stage:
+    Type: String
+    Description: The deployment stage used by API Gateway
+    Default: {Stage name}
+  APIGName:
+    Type: String
+    Description: API Gateway Name
+    Default: {API Gateway name}
+  LambdaAlias:
+    Type: String
+    Description: Alias for lambda version
+    Default: live
+  VpcId:
+    Type: String
+    Description: Vpc id
+    Default: {VpcId}
+  SubnetId1:
+    Type: String
+    Description: {SubnetId1}
+  ManagerEmail:
+    Type: String
+    Description: email
+    Default: {Email}
+  CloudWatchRoleArn:
+    Type: String
+    Description: role.arn for api gateway's cloudwatch logs
+    Default: {CloudWatchRoleArn}
+Resources:
+  ApiGatewayLogRole:
+    Type: AWS::ApiGateway::Account
+    Properties: 
+      CloudWatchRoleArn: !Ref CloudWatchRoleArn
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Ref APIGName
+      DefinitionBody:
+        swagger: 2.0
+        info:
+          title: !Sub '/${Stage}Server'
+        basePath: !Sub '/${Stage}'
+        schemes:
+        - https
+        paths:
+          '/':
+            x-amazon-apigateway-any-method:
+              produces:
+              - application/json
+              responses:
+                '200':
+                  description: 200 response
+                  schema:
+                    $ref: '#/definitions/Empty'
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: 200
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Index}:${LambdaAlias}/invocations'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+          '/{proxy+}':
+            x-amazon-apigateway-any-method:
+              produces:
+              - application/json
+              parameters:
+              - name: proxy
+                in: path
+                required: true
+                type: string
+              responses: {}
+              x-amazon-apigateway-integration:
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Index}:${LambdaAlias}/invocations'
+                httpMethod: POST
+                type: aws_proxy
+        x-amazon-apigateway-binary-media-types:
+          - 'multipart/*'
+          - 'text/*'
+        definitions:
+          Empty:
+            type: object
+            title: Empty Schema
+      StageName: !Ref Stage
+      Variables:
+        FuncName: !Sub '${Index}:${LambdaAlias}'
+      MethodSettings:
+        - DataTraceEnabled: true
+          LoggingLevel: INFO
+          ResourcePath: /*
+          MetricsEnabled: true
+          HttpMethod: '*'
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: '/'
+  LambdaRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaRolePolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+              - iam:*
+              - sns:*
+              - ec2:*
+            Resource:
+              - '*'
+      Roles:
+        - Ref: LambdaRole
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupName: !Sub '${APIGName}DefaultGroup'
+      GroupDescription: default group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${APIGName}-Sg'
+        - Key: ResourceType
+          Value: !Sub '${APIGName}'        
+  Index:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: index.handler
+      MemorySize: 256
+      Runtime: nodejs8.10
+      Timeout: 5
+      Role: !GetAtt LambdaRole.Arn
+      DeadLetterQueue:
+        Type: SNS
+        TargetArn: !Ref SnsTopic 
+      AutoPublishAlias: !Ref LambdaAlias
+      ReservedConcurrentExecutions: 1
+      DeploymentPreference:
+        Enabled: true
+        Type: AllAtOnce
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref AppSg
+        SubnetIds:
+          - !Ref SubnetId1
+  PermissionForAPIGatewayToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - Index
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !Ref Index.Alias
+      Principal: apigateway.amazonaws.com
+  SnsTopic:
+    Type: 'AWS::SNS::Topic'
+    Description: notify to app manager
+    Properties:
+      Subscription:
+        - Endpoint: !Ref ManagerEmail
+          Protocol: email
+  SnsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: CloudWatchEventPolicy
+        Statement:
+          - Sid: !Sub '${APIGName}-statement-id'
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: sns:Publish
+            Resource: '*'
+      Topics:
+        - !Ref SnsTopic
+  5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: ApiGateway
+    Properties:
+      AlarmDescription: 5xx alarm for api gateway
+      Namespace: AWS/ApiGateway
+      AlarmActions:
+        - !Ref SnsTopic
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref APIGName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+  ApiDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref APIGName
+      DashboardBody: !Sub '{"widgets":[{"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"metrics":[["AWS/ApiGateway","5XXError","ApiName","${APIGName}"]],"period":300,"stat":"Sum","region":"ap-northeast-1","title":"5xx error metric"}}, {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"metrics":[["AWS/ApiGateway","Latency","ApiName","${APIGName}"]],"period":300,"stat":"Sum","region":"ap-northeast-1","title":"Latency metric"}}]}'
+  ApiGatewayLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    DependsOn: ApiGateway
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub 'API-Gateway-Execution-Logs_${ApiGateway}/${Stage}'
+  LambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    DependsOn: Index
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub '/aws/lambda/${Index}'

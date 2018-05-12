@@ -1,0 +1,25 @@
+version: 0.0
+environment_variables:
+    plaintext:
+        "S3_ARTIFACT_BUCKET": ""
+        "CONFIG_FOLDER": ""
+containers:
+    LambdaFunctions:
+        phases:
+            install:
+                commands:
+                    - npm install -g npm
+            pre_build:
+                commands:
+                    - aws s3 sync s3://${S3_ARTIFACT_BUCKET}/config/env/${CONFIG_FOLDER} ./src/config/env
+            build:
+                commands:
+                    - npm run build                    
+            post_build:
+                commands:     
+                    - rm -rf ./node_modules
+                    - npm install --production
+                    - aws cloudformation package --template $INPUT_FILE --s3-bucket $S3_ARTIFACT_BUCKET --output-template staging-post-package.yaml
+        artifacts:
+            files:
+                - staging-post-package.yaml
